@@ -1,306 +1,108 @@
---!strict
--- /Modules/Panels/VFXViewportController.lua (Corrected Version)
+# main.py - Your public VFX Resolution Server
 
--- Shared & Core Modules
-local Janitor = require(script.Parent.Parent.Shared.Janitor)
-local ViewportEmitter = require(script.Parent.ViewportEmitter)
+# Import all necessary libraries
+import requests
+import io
+import concurrent.futures
+from flask import Flask, request, jsonify
+from PIL import Image
+from waitress import serve # A production-ready server for Flask
 
-local VFXViewportController = {}
-VFXViewportController.__index = VFXViewportController
-
-local BUFFER_ROWS = 2
-local PADDING = 10
-local DEFAULT_CAMERA_FOV = 50
-local DEFAULT_CAMERA_DISTANCE = 25
-
-local function deserialize(dataType, dataValue)
-	if dataType == "ColorSequence" then
-		local keypoints = {}
-		for _, kp in ipairs(dataValue) do
-			table.insert(keypoints, ColorSequenceKeypoint.new(kp.Time, Color3.new(unpack(kp.Value))))
-		end
-		return ColorSequence.new(keypoints)
-	elseif dataType == "NumberSequence" then
-		local keypoints = {}
-		for _, kp in ipairs(dataValue) do
-			table.insert(keypoints, NumberSequenceKeypoint.new(kp.Time, kp.Value, kp.Envelope))
-		end
-		return NumberSequence.new(keypoints)
-	elseif dataType == "NumberRange" then
-		return NumberRange.new(dataValue.Min, dataValue.Max)
-	end
-	return nil
-end
-
-function VFXViewportController.new(scrollingFrame, addButton, vfxTemplate)
-	local self = setmetatable({}, VFXViewportController)
-	self.janitor = Janitor.new()
-	self.frame = scrollingFrame
-	self.addButton = addButton
-	self.template = vfxTemplate
-	self.eventJanitor = nil
-	self.addButton.AnchorPoint = Vector2.new(0, 0)
-	self.addButton.Parent = nil
-	self.addButton.Visible = false
-	if self.template then self.template.Visible = false end
-	self.dataSource = {}
-	self.activeItems = {}
-	self.inactivePool = {}
-	self.itemsPerRow = 1
-	self.totalRows = 0
-	self.cellSize = 128
-	self.updateLayoutRequested = false
-	self.isActive = false
-	return self
-end
-
-function VFXViewportController:Activate()
-	if self.isActive then return end
-	self.isActive = true
-	self.frame.Visible = true
-	self.addButton.Parent = self.frame
-	self.addButton.Visible = true
-	self.eventJanitor = Janitor.new()
-	self:_setupListeners()
-	self:recalculateLayout()
-end
-
-function VFXViewportController:Deactivate()
-	if not self.isActive then return end
-	self.isActive = false
-	self.frame.Visible = false
-	self.addButton.Parent = nil
-	self.addButton.Visible = false
-	if self.eventJanitor then
-		self.eventJanitor:Cleanup()
-		self.eventJanitor = nil
-	end
-	self:_clearAllItems()
-	self.frame.CanvasSize = UDim2.fromScale(0, 0)
-end
-
-function VFXViewportController:setDataSource(data)
-	self:_clearAllItems()
-	self.dataSource = data or {}
-	if self.isActive then
-		self:recalculateLayout()
-	end
-end
-
-function VFXViewportController:_loadItem(dataIndex)
-	if self.activeItems[dataIndex] then return end
-	local data = self.dataSource[dataIndex]
-	if not data then return end
-
-	local itemJanitor = self.eventJanitor:Add(Janitor.new())
-	local instance = self:_getTemplateInstance()
-	local viewportFrame = instance:FindFirstChild("Viewport", true)
-	if not viewportFrame or not viewportFrame:IsA("ViewportFrame") then
-		instance:Destroy()
-		return
-	end
-
-	local worldModel = Instance.new("WorldModel")
-	worldModel.Parent = viewportFrame
-	itemJanitor:Add(worldModel)
-
-	local hostPart = Instance.new("Part")
-	hostPart.Name = "VFXHostPart"
-	hostPart.Size = Vector3.new(1, 1, 1)
-	hostPart.Anchored = true
-	hostPart.CanCollide = false
-	hostPart.Transparency = 1
-	hostPart.Parent = worldModel
-
-	local hostCamera = Instance.new("Camera")
-	hostCamera.Name = "VFXHostCamera"
-	hostCamera.Parent = worldModel
-	viewportFrame.CurrentCamera = hostCamera
-
-	-- Create a list of properties to process. This supports both old and new formats.
-	local propertiesList = {}
-	if data.Emitters and #data.Emitters > 0 then
-		-- New format: A group of emitters
-		propertiesList = data.Emitters
-	elseif data.Properties then
-		-- Old format: A single emitter
-		table.insert(propertiesList, data.Properties)
-	end
-
-	if #propertiesList == 0 then
-		instance:Destroy()
-		return
-	end
-
-	-- Use the first emitter's properties to set up the camera as a default
-	local firstProps = propertiesList[1]
-	if firstProps.ParentCFrame then
-		hostPart.CFrame = CFrame.new(unpack(firstProps.ParentCFrame))
-	end
-	if firstProps.CameraCFrame and firstProps.CameraFieldOfView then
-		hostCamera.CFrame = CFrame.new(unpack(firstProps.CameraCFrame))
-		hostCamera.FieldOfView = firstProps.CameraFieldOfView
-	else
-		hostCamera.FieldOfView = DEFAULT_CAMERA_FOV
-		local cameraPosition = hostPart.Position + Vector3.new(DEFAULT_CAMERA_DISTANCE * 0.75, DEFAULT_CAMERA_DISTANCE * 0.5, DEFAULT_CAMERA_DISTANCE * 0.75)
-		hostCamera.CFrame = CFrame.lookAt(cameraPosition, hostPart.Position)
-	end
-
-	for _, props in ipairs(propertiesList) do
-		local emitterData = {
-			-- (All existing properties remain here)
-			Texture = props.Texture or "",
-			Rate = props.Rate or 10,
-			Drag = props.Drag or 0,
-			Lifetime = props.Lifetime and deserialize("NumberRange", props.Lifetime) or NumberRange.new(1),
-			Speed = props.Speed and deserialize("NumberRange", props.Speed) or NumberRange.new(5),
-			Rotation = props.Rotation and deserialize("NumberRange", props.Rotation) or NumberRange.new(0, 360),
-			RotSpeed = props.RotSpeed and deserialize("NumberRange", props.RotSpeed) or NumberRange.new(0),
-			Size = (props.Size and props.Size.Keypoints) and deserialize("NumberSequence", props.Size.Keypoints) or NumberSequence.new(1),
-			Color = (props.Color and props.Color.Keypoints) and deserialize("ColorSequence", props.Color.Keypoints) or ColorSequence.new(Color3.new(1,1,1)),
-			Transparency = (props.Transparency and props.Transparency.Keypoints) and deserialize("NumberSequence", props.Transparency.Keypoints) or NumberSequence.new(0),
-			Acceleration = props.Acceleration and Vector3.new(unpack(props.Acceleration)) or Vector3.new(0,0,0),
-			SpreadAngle = props.SpreadAngle and Vector2.new(unpack(props.SpreadAngle)) or Vector2.new(0,0),
-			EmissionDirection = props.EmissionDirection and Enum.NormalId[props.EmissionDirection] or Enum.NormalId.Top,
-			Orientation = props.Orientation and Enum.ParticleOrientation[props.Orientation] or Enum.ParticleOrientation.FacingCamera,
-			EmitDuration = props.EmitDuration,
-			EmitDelay = props.EmitDelay,
-			EmitCount = props.EmitCount,
-
-			-- ==================================================================
-			-- FLIPBOOK PROPERTIES (NEW)
-			-- ==================================================================
-			FlipbookLayout = props.FlipbookLayout and Enum.ParticleFlipbookLayout[props.FlipbookLayout] or Enum.ParticleFlipbookLayout.None,
-			FlipbookMode = props.FlipbookMode and Enum.ParticleFlipbookMode[props.FlipbookMode] or Enum.ParticleFlipbookMode.Loop,
-			FlipbookFramerate = props.FlipbookFramerate or 15,
-			FlipbookStartRandom = props.FlipbookStartRandom or false,
-			-- Correctly deserialize the TextureSize table into a Vector2
-			TextureSize = props.TextureSize and Vector2.new(unpack(props.TextureSize)) or nil,
-		}
-
-		local viewportEmitter = ViewportEmitter.new(emitterData, hostPart, viewportFrame, hostCamera)
-		itemJanitor:Add(viewportEmitter)
-		viewportEmitter:Start()
-	end
-
-	local nameLabel = instance:FindFirstChild("Frame", true):FindFirstChild("Name", true)
-	if nameLabel and nameLabel:IsA("TextLabel") then nameLabel.Text = data.Name or "Unnamed VFX" end
-
-	local gridIndex = dataIndex
-	local row = math.floor((gridIndex - 1) / self.itemsPerRow)
-	local col = (gridIndex - 1) % self.itemsPerRow
-	local xPos = PADDING + col * (self.cellSize + PADDING)
-	local yPos = PADDING + (row + 1) * (self.cellSize + PADDING)
-
-	instance.Name = "VFXTemplate_" .. tostring(dataIndex)
-	instance.Position = UDim2.fromOffset(xPos, yPos)
-	instance.Visible = true
-	instance.Parent = self.frame
-
-	self.activeItems[dataIndex] = { instance = instance, janitor = itemJanitor }
-end
+# --- Configuration ---
+# CRITICAL: Use a new, alternate Roblox account (a "bot") for this cookie.
+# DO NOT use your main account's cookie on a public server.
+ROBLOSECURITY_COOKIE = '_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_GgIQAQ.7E3B86CB2E01795C60F7C1E8EB1BCC0C0AE62B73A8394A85C98009B4FAA11DB62686B666825AA86205F4394DDB77097DEFF8E10F2AD9DE806AAEA340384162EEE15278B16F6D05266D068828C8948A3AAE2985822339333F633401AFD75A3E710714CC763559C4941D8FD9E13650B4E2C232DDC48B8C6FE6896A19B11D6A30406978E7AE25D6728259B77AAF07C993C0F12DA9CD8CA2204FB3149A69887B1AFF5073092C3AA527A3782E390965104CD3A170CE35FBFD62830AF42C8E9B3DB800D5B8FEBDFC9B2C0FC3076E54EC3F8E135B06E5265E37922C1283DA02ECBD63BEEFA1C757C65B7EF625BE000B13ECBF31BDB512951490AA42661C4068E062E6F3AEFB2F26BC0F90498F79431BC698492B738C53C90C92F2FAA0B933AECDD047870890BBB1D3EDC2110119808A4B55DE123A87FCECF1EABF38C552FBA19BDD924FEB89F7BBB618220857CD4E77EAB948E5AC66FCD432560C4C44076F8102CFBD6CA271496177EF775B7D3DBED03C3F62F55F27A2E454516B6CC293C439ABF6AEF4225429A1D02AE02291F3B2C8794027D354011A374AEA57ABD8B5640430AEE1B153A287291EC930F222FD394FD4B8809F620C1BE8E00D5DDA8936D5AF57864B14DC978096B35572819FD957060C3CD7DA7C2686C06AA8346A6B4E0EC8BDDDCC11D4880AF7F41133971E17237EC839E263C2F54692FEF200745A5BDAEAB3FCDE0A5626CEA4DABF4CD99248CD38A06A60CA526E30824EED0EDA2BA85F8FB25E79A42B6532E53F73B9BC303CD446F07CB188A1072F086817BE530CE92D64DFE23E3D716A9A4E1B7DC0A708CFC917FEC44664F26C87C74E8181B485F621612BC3378E58FE8056F51C6C0A9CBFEE4DD6EE7BCCA0D1FEEAF64C37F640F087EA0587D52B602FD539E9F64585A00269CC646051EC155F54C3C7B431F067447CAA34223D4C73FAC86FED333E11BE3CEB54CB409F6F0B877C40F5603EFCFDC4C2C3D9070CE3902F79D3DA068736299CC037720F9991CF062629A06D8AB2BF2DB64E4C4FE4F9DE27EE3E956FFBD5528892ABDEDA4FA7BBFD4962CD78AF0E9E80A4F23D66B5D11CF1AE07607BD608479AFE73094FF10733F35D7D2441270B7B1401B080E3EE1309189D6C'
 
 
--- (The rest of VFXViewportController.lua remains unchanged)
-function VFXViewportController:_unloadItem(dataIndex)
-	local itemData = self.activeItems[dataIndex]
-	if itemData then
-		itemData.janitor:Cleanup()
-		itemData.instance.Parent = nil
-		table.insert(self.inactivePool, itemData.instance)
-		self.activeItems[dataIndex] = nil
-	end
-end
 
-function VFXViewportController:_setupListeners()
-	if not self.eventJanitor then return end
-	self.eventJanitor:Add(self.frame:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
-		self:_requestUpdateVisibleItems()
-	end))
-	self.eventJanitor:Add(self.frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-		self:recalculateLayout()
-	end))
-end
+# --- Flask App & Session Setup ---
+app = Flask(__name__)
 
-function VFXViewportController:recalculateLayout()
-	if not self.isActive or not self.frame.Parent or not self.addButton.Parent then return end
-	local frameWidth = self.frame.AbsoluteSize.X - self.frame.ScrollBarThickness
-	self.cellSize = self.template.Size.X.Offset
-	if self.cellSize <= 0 then self.cellSize = 128 end
-	self.itemsPerRow = math.max(1, math.floor((frameWidth + PADDING) / (self.cellSize + PADDING)))
-	self.totalRows = math.ceil((#self.dataSource + 1) / self.itemsPerRow)
-	local canvasHeight = (self.totalRows * (self.cellSize + PADDING)) + PADDING
-	self.frame.CanvasSize = UDim2.fromOffset(0, canvasHeight)
-	self.addButton.Position = UDim2.fromOffset(PADDING, PADDING)
-	for dataIndex, itemData in pairs(self.activeItems) do
-		local gridIndex = dataIndex
-		local row = math.floor((gridIndex - 1) / self.itemsPerRow)
-		local col = (gridIndex - 1) % self.itemsPerRow
-		local xPos = PADDING + col * (self.cellSize + PADDING)
-		local yPos = PADDING + (row + 1) * (self.cellSize + PADDING)
-		itemData.instance.Position = UDim2.fromOffset(xPos, yPos)
-	end
-	self:_requestUpdateVisibleItems()
-end
+# Create a persistent session to reuse the connection and cookie
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'application/json'
+})
+session.cookies.update({
+    '.ROBLOSECURITY': ROBLOSECURITY_COOKIE
+})
 
-function VFXViewportController:_requestUpdateVisibleItems()
-	if not self.isActive or self.updateLayoutRequested then return end
-	self.updateLayoutRequested = true
-	task.defer(function()
-		if self.isActive and self.frame.Parent then
-			self:_updateVisibleItems()
-		end
-		self.updateLayoutRequested = false
-	end)
-end
 
-function VFXViewportController:_updateVisibleItems()
-	if not self.isActive or not self.frame.Parent or self.itemsPerRow == 0 then return end
-	local effectiveRowHeight = self.cellSize + PADDING
-	if effectiveRowHeight <= 0 then return end
-	local viewportY, viewportHeight = self.frame.CanvasPosition.Y, self.frame.AbsoluteSize.Y
-	if viewportY == nil or viewportHeight == nil or self.totalRows == nil then return end
-	local firstVisibleRow = math.max(0, math.floor(viewportY / effectiveRowHeight) - BUFFER_ROWS)
-	local lastVisibleRow = math.min(self.totalRows - 1, math.ceil((viewportY + viewportHeight) / effectiveRowHeight) - 1 + BUFFER_ROWS)
-	if lastVisibleRow < firstVisibleRow then return end
-	local visibleDataIndices = {}
-	for row = firstVisibleRow, lastVisibleRow do
-		for col = 0, self.itemsPerRow - 1 do
-			local gridIndex = row * self.itemsPerRow + col
-			local dataIndex = gridIndex
-			if dataIndex > 0 and dataIndex <= #self.dataSource then
-				visibleDataIndices[dataIndex] = true
-			end
-		end
-	end
-	local itemsToUnload = {}
-	for loadedDataIndex in pairs(self.activeItems) do
-		if not visibleDataIndices[loadedDataIndex] then
-			table.insert(itemsToUnload, loadedDataIndex)
-		end
-	end
-	for _, indexToUnload in ipairs(itemsToUnload) do
-		self:_unloadItem(indexToUnload)
-	end
-	for dataIndexToLoad in pairs(visibleDataIndices) do
-		if not self.activeItems[dataIndexToLoad] then
-			self:_loadItem(dataIndexToLoad)
-		end
-	end
-end
+# --- Core Logic ---
+def fetch_asset_resolution(asset_id: str):
+    """
+    Fetches a single asset from Roblox and returns its width and height.
+    This function is designed to be run in a separate thread.
+    """
+    api_url = f"https://assetdelivery.roblox.com/v1/asset/?id={asset_id}"
+    try:
+        # Make the request to download the asset data
+        response = session.get(api_url, timeout=10, allow_redirects=True)
+        response.raise_for_status() # Raise an error for bad status codes (like 403 Forbidden)
 
-function VFXViewportController:_getTemplateInstance()
-	if #self.inactivePool > 0 then return table.remove(self.inactivePool)
-	else return self.template:Clone() end
-end
-function VFXViewportController:_clearAllItems()
-	for index in pairs(self.activeItems) do self:_unloadItem(index) end
-end
-function VFXViewportController:Destroy()
-	self:_clearAllItems()
-	if self.addButton then self.addButton.Parent = nil end
-	self.janitor:Cleanup()
-	setmetatable(self, nil)
-end
+        # Check if the response is empty
+        if not response.content:
+            print(f"  [EMPTY RESPONSE] Asset {asset_id}")
+            return asset_id, None
 
-return VFXViewportController
+        # Use Pillow to open the image data from memory and get its size
+        with Image.open(io.BytesIO(response.content)) as img:
+            width, height = img.size
+            print(f"  [SUCCESS] Asset {asset_id}: {width}x{height}")
+            # Return the data in a format Lua can understand
+            return asset_id, {"x": width, "y": height}
+
+    except Exception as e:
+        # This will catch network errors, invalid image data, etc.
+        print(f"  [FAILED] Asset {asset_id}: {e}")
+        return asset_id, None
+
+
+# --- API Endpoint Definition ---
+@app.route('/get_resolutions', methods=['POST'])
+def get_resolutions_endpoint():
+    """
+    This is the main endpoint that the Roblox plugin will call.
+    It receives a list of asset IDs and returns their resolutions.
+    """
+    print("\nReceived request from Roblox Studio...")
+    data = request.json
+    if not data or 'asset_ids' not in data:
+        return jsonify({"error": "Invalid request format. Expecting {'asset_ids': [...]}"}), 400
+
+    asset_ids = data['asset_ids']
+    print(f"Processing {len(asset_ids)} asset IDs...")
+
+    resolutions_map = {}
+    # Use a ThreadPoolExecutor to fetch all asset resolutions concurrently for speed
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # Create a dictionary of future tasks
+        future_to_asset = {executor.submit(fetch_asset_resolution, asset_id): asset_id for asset_id in asset_ids}
+        # Process results as they are completed
+        for future in concurrent.futures.as_completed(future_to_asset):
+            asset_id, resolution = future.result()
+            if resolution:
+                resolutions_map[asset_id] = resolution
+
+    print("...Finished processing. Sending response to Studio.")
+    # Return the final map of resolutions as a JSON response
+    return jsonify(resolutions_map)
+
+
+# --- Main Execution Block ---
+if __name__ == '__main__':
+    # Check if the placeholder cookie is still there
+    if 'PASTE_YOUR_BOT_ACCOUNTS_COOKIE_HERE' in ROBLOSECURITY_COOKIE:
+        print("\n" + "="*60)
+        print("🛑 ERROR: You have not replaced the placeholder .ROBLOSECURITY cookie.")
+        print("🛑 Please edit the script and paste your bot account's cookie.")
+        print("="*60 + "\n")
+    else:
+        # This will run when you click the "Run" button on Replit
+        print("\n" + "="*60)
+        print("✅ Roblox Resolution Server is starting...")
+        print("✅ Listening for requests from your plugin.")
+        print("="*60 + "\n")
+        # Use waitress to serve the Flask app on all available network interfaces
+        serve(app, host='0.0.0.0', port=8080)
